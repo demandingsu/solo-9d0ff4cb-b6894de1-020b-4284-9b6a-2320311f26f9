@@ -14,12 +14,15 @@ from fastapi.responses import JSONResponse
 from . import db, services
 from .models import (
     AdjustedQuote,
+    BarsResponse,
     BatchOut,
     CorporateActionImportRequest,
     CorporateActionOut,
     ImportResponse,
     QuoteImportRequest,
     RawQuote,
+    TradePacketImportResponse,
+    TradePacketIn,
 )
 from .services import Rejected
 
@@ -32,10 +35,12 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="拆股复权行情 API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "版本化日行情与拆股/并股公告导入，按入库截止批次返回"
-            "前后可比的复权价量。**后来补报的公告不会改写旧批次结果。**"
+            "前后可比的复权价量。**后来补报的公告不会改写旧批次结果。**\n\n"
+            "逐笔汇总：按包（一证券一交易日）补传成交/撤销回报，"
+            "实时重算分钟线并聚合同日日线，供行情加工员两级核对。"
         ),
         lifespan=lifespan,
     )
@@ -81,6 +86,23 @@ def create_app() -> FastAPI:
     def import_actions(req: CorporateActionImportRequest) -> ImportResponse:
         result = services.import_actions(req.actions)
         return ImportResponse(**result)
+
+    @app.post(
+        "/imports/trade-packets",
+        response_model=TradePacketImportResponse,
+        status_code=201,
+        tags=["逐笔汇总"],
+        summary="补包导入逐笔成交/撤销回报（一包 = 一个证券 + 一个交易日）",
+        description=(
+            "成交回报带成交号、UTC 成交时间、价格、数量；撤销回报只需成交号。"
+            "撤销是墓碑：先撤到时迟到的原成交也不计入。原样重传幂等；"
+            "同号成交异值整包退回（422），原有结果保留。"
+            "成功后在同一事务内重算受影响分钟并生成入库批次。"
+        ),
+    )
+    def import_trade_packet(req: TradePacketIn) -> TradePacketImportResponse:
+        result = services.import_trade_packet(req)
+        return TradePacketImportResponse(**result)
 
     # ---------- 查询 ----------
 
@@ -144,6 +166,27 @@ def create_app() -> FastAPI:
         cutoff_batch: int | None = Query(None),
     ) -> list[CorporateActionOut]:
         return services.query_actions(security_code, cutoff_batch)
+
+    @app.get(
+        "/bars",
+        response_model=BarsResponse,
+        tags=["逐笔汇总"],
+        summary="分钟线 + 当日汇总核对查询（两级来自同一已提交状态）",
+        description=(
+            "按未撤成交返回该证券该交易日的分钟线（UTC 分钟升序）与当日"
+            "开高低收/成交量；被清空的分钟不出现在结果中。仍有成交时附 "
+            "`daily_quote_import`：带调用方指定修订号、可直接提交 "
+            "`POST /imports/quotes` 的日线数据。"
+        ),
+    )
+    def bars(
+        security_code: str = Query(..., description="证券代码"),
+        trade_date: str = Query(..., description="交易日 YYYY-MM-DD"),
+        revision: int = Query(
+            0, ge=0, description="写回 daily_quote_import 的修订号（调用方指定）"
+        ),
+    ) -> BarsResponse:
+        return services.query_bars(security_code, trade_date, revision)
 
     return app
 

@@ -29,6 +29,10 @@ def get(path):
 results = []
 barrier = threading.Barrier(N)
 
+# 竞争前的批次基线（e2e 可能已产生任意数量的批次）
+_, baseline_batches = get("/batches")
+baseline_max = max((b["id"] for b in baseline_batches), default=0)
+
 
 def worker(i):
     payload = {"quotes": [{
@@ -66,7 +70,7 @@ assert read_errors == []
 print("并发读看到的截止批次 =", sorted(seen_cutoffs))
 
 s, batches = get("/batches")
-cont_batches = [b for b in batches if b["id"] > 3]
+cont_batches = [b for b in batches if b["id"] > baseline_max]
 # 竞争中只有一个事务成功提交 => 只多一个批次
 assert len(cont_batches) == 1, cont_batches
 

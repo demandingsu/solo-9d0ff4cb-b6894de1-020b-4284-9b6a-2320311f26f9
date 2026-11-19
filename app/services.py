@@ -2,15 +2,24 @@
 
 不变量
 ======
-1. 只追加：行情/公告表从不 UPDATE/DELETE，修订号决定生效版本。
+1. 只追加：行情/公告/逐笔事件表从不 UPDATE/DELETE，修订号决定生效版本。
 2. 同键（行情=证券+交易日，公告=证券+事件号）同修订异值 => 整批拒收；
    新请求修订号低于库中已生效修订 => 整批拒收（后来补报不能覆盖旧序列）。
 3. 每次 *成功* 导入在同一事务内生成一个入库批次；失败回滚，不留批次。
 4. 查询在单个快照事务内完成，截止批次之后提交的任何数据都不可见。
+
+逐笔汇总（补包）
+================
+* 一包 = 一个证券 + 一个交易日，包内成交/撤销回报整包原子生效；
+* 撤销是墓碑：无论撤销先到还是成交先到，该成交号一律不计入汇总；
+* 原样重传幂等跳过；同号成交异值 => 整包退回（422），原有结果保留；
+* 分钟线物化在 minute_bars，补包事务内只扫描受影响分钟的逐笔明细重算，
+  被清空的分钟整行删除；日线在查询时由分钟线聚合，两级来自同一快照。
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections.abc import Iterable
 from datetime import date
@@ -19,12 +28,18 @@ from decimal import ROUND_HALF_UP, Decimal
 from . import db
 from .models import (
     AdjustedQuote,
+    BarsResponse,
     BatchOut,
     CorporateActionIn,
     CorporateActionOut,
+    DailyBar,
+    DailyQuoteImport,
     EventBasis,
+    MinuteBar,
     QuoteIn,
     RawQuote,
+    TradePacketIn,
+    TradeReportIn,
 )
 
 # 折算值保留 5 位小数（ROUND_HALF_UP，金融惯例）
@@ -267,6 +282,243 @@ def import_actions(
         "row_count": inserted,
         "received": len(rows),
     }
+
+
+# ---------------------------------------------------------------- 逐笔补包
+
+
+def _minute_of(trade_time: str) -> str:
+    """归一化 UTC 时间 -> 所在分钟（YYYY-MM-DDTHH:MM:00Z）。"""
+    return trade_time[:16] + ":00Z"
+
+
+def _trade_signature(t: TradeReportIn) -> tuple:
+    return (t.trade_time, t.price, t.quantity)
+
+
+def import_trade_packet(packet: TradePacketIn, db_file: str | None = None) -> dict:
+    """补包导入：整包原子生效，失败回滚、原有分钟线/日线结果保留。
+
+    规则：同号成交包内异值或与库中异值 => 整包退回；原样重传幂等跳过；
+    撤销是墓碑（先撤后到也不计入）；只重算受影响分钟。
+    """
+    # 包内归一化：同号成交同值去重、异值整包退回；撤销只需成交号，去重即可
+    trades: dict[int, TradeReportIn] = {}
+    for t in packet.trades:
+        old = trades.get(t.trade_no)
+        if old is not None:
+            if _trade_signature(old) != _trade_signature(t):
+                raise Rejected(
+                    f"同号成交异值拒收：成交号 {t.trade_no} 在包内出现不同值，整包退回"
+                )
+            continue
+        trades[t.trade_no] = t
+    revoke_nos = {r.trade_no for r in packet.revocations}
+
+    code, tdate = packet.security_code, packet.trade_date
+    with db.get_conn(db_file) as conn:
+        try:
+            with db.write_transaction(conn):
+                _ensure_securities(conn, {code})
+                cur = conn.execute(
+                    "INSERT INTO ingest_batches(payload_kind, row_count) "
+                    "VALUES ('trade_packet', 0)"
+                )
+                batch_id = cur.lastrowid
+
+                affected: set[str] = set()
+                applied_trades = 0
+                new_trade_nos: set[int] = set()
+                for trade_no, t in sorted(trades.items()):
+                    row = conn.execute(
+                        "SELECT trade_time, price, quantity FROM trade_events "
+                        "WHERE security_code = ? AND trade_date = ? "
+                        "AND trade_no = ? AND kind = 'trade'",
+                        (code, tdate, trade_no),
+                    ).fetchone()
+                    if row is not None:
+                        if (row["trade_time"], row["price"], row["quantity"]) != (
+                            _trade_signature(t)
+                        ):
+                            raise Rejected(
+                                f"同号成交异值拒收：证券 {code} 交易日 {tdate} "
+                                f"成交号 {trade_no} 已入库值与本次不同，整包退回"
+                            )
+                        continue  # 原样重传：幂等跳过，不重复计量
+                    conn.execute(
+                        "INSERT INTO trade_events(security_code, trade_date, trade_no, "
+                        "kind, trade_time, price, quantity, minute_ts, ingest_batch_id) "
+                        "VALUES (?, ?, ?, 'trade', ?, ?, ?, ?, ?)",
+                        (
+                            code, tdate, trade_no, t.trade_time, t.price, t.quantity,
+                            _minute_of(t.trade_time), batch_id,
+                        ),
+                    )
+                    applied_trades += 1
+                    new_trade_nos.add(trade_no)
+                    # 撤销先到（库中已有墓碑）或同包即撤：该成交不计入
+                    if trade_no in revoke_nos:
+                        continue
+                    revoked = conn.execute(
+                        "SELECT 1 FROM trade_events WHERE security_code = ? "
+                        "AND trade_date = ? AND trade_no = ? AND kind = 'revoke'",
+                        (code, tdate, trade_no),
+                    ).fetchone()
+                    if revoked is None:
+                        affected.add(_minute_of(t.trade_time))
+
+                applied_revokes = 0
+                for trade_no in sorted(revoke_nos):
+                    exists = conn.execute(
+                        "SELECT 1 FROM trade_events WHERE security_code = ? "
+                        "AND trade_date = ? AND trade_no = ? AND kind = 'revoke'",
+                        (code, tdate, trade_no),
+                    ).fetchone()
+                    if exists:
+                        continue  # 重复撤销：幂等跳过
+                    conn.execute(
+                        "INSERT INTO trade_events(security_code, trade_date, trade_no, "
+                        "kind, ingest_batch_id) VALUES (?, ?, ?, 'revoke', ?)",
+                        (code, tdate, trade_no, batch_id),
+                    )
+                    applied_revokes += 1
+                    if trade_no in new_trade_nos:
+                        continue  # 本包新成交随即被撤：从未计入，分钟不受影响
+                    tr = conn.execute(
+                        "SELECT minute_ts FROM trade_events WHERE security_code = ? "
+                        "AND trade_date = ? AND trade_no = ? AND kind = 'trade'",
+                        (code, tdate, trade_no),
+                    ).fetchone()
+                    if tr is not None:
+                        # 此前计入的成交被撤 => 其分钟受影响（撤销先到无成交行则无需重算）
+                        affected.add(tr["minute_ts"])
+
+                _recompute_minutes(conn, code, tdate, affected, batch_id)
+                conn.execute(
+                    "UPDATE ingest_batches SET row_count = ? WHERE id = ?",
+                    (applied_trades + applied_revokes, batch_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            # 唯一索引兜底：并发补同一 (键, 类别) 时其中一个事务在此失败
+            raise Rejected(f"补包与已入库数据冲突，整包退回：{exc}", 409) from exc
+
+    return {
+        "batch_id": batch_id,
+        "payload_kind": "trade_packet",
+        "row_count": applied_trades + applied_revokes,
+        "received": len(packet.trades) + len(packet.revocations),
+        "applied_trades": applied_trades,
+        "applied_revocations": applied_revokes,
+        "affected_minutes": len(affected),
+    }
+
+
+def _recompute_minutes(
+    conn: sqlite3.Connection,
+    code: str,
+    tdate: str,
+    minutes: set[str],
+    batch_id: int,
+) -> None:
+    """只扫描受影响分钟的逐笔明细重算分钟线；无未撤成交的分钟整行删除。
+
+    开/收 = 该分钟未撤成交按 (成交时间, 成交号) 升序的首/尾笔价格。
+    """
+    for minute in sorted(minutes):
+        rows = conn.execute(
+            """
+            SELECT t.trade_time, t.trade_no, t.price, t.quantity
+            FROM trade_events t
+            WHERE t.security_code = ? AND t.trade_date = ?
+              AND t.kind = 'trade' AND t.minute_ts = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM trade_events r
+                  WHERE r.security_code = t.security_code
+                    AND r.trade_date = t.trade_date
+                    AND r.trade_no = t.trade_no
+                    AND r.kind = 'revoke'
+              )
+            ORDER BY t.trade_time, t.trade_no
+            """,
+            (code, tdate, minute),
+        ).fetchall()
+        if not rows:
+            conn.execute(
+                "DELETE FROM minute_bars WHERE security_code = ? "
+                "AND trade_date = ? AND minute_ts = ?",
+                (code, tdate, minute),
+            )
+            continue
+        prices = [r["price"] for r in rows]
+        conn.execute(
+            """
+            INSERT INTO minute_bars(security_code, trade_date, minute_ts,
+                                    open, high, low, close, volume, trade_count,
+                                    updated_batch_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(security_code, trade_date, minute_ts) DO UPDATE SET
+                open = excluded.open, high = excluded.high, low = excluded.low,
+                close = excluded.close, volume = excluded.volume,
+                trade_count = excluded.trade_count,
+                updated_batch_id = excluded.updated_batch_id
+            """,
+            (
+                code, tdate, minute,
+                rows[0]["price"], max(prices), min(prices), rows[-1]["price"],
+                math.fsum(r["quantity"] for r in rows), len(rows), batch_id,
+            ),
+        )
+
+
+def query_bars(
+    code: str,
+    tdate: str,
+    revision: int = 0,
+    db_file: str | None = None,
+) -> BarsResponse:
+    """分钟线 + 当日汇总，同一只读快照内取数，两级必来自同一已提交状态。
+
+    日线由分钟线聚合：开=最早分钟开、收=最晚分钟收、高/低=分钟极值、量=求和。
+    仍有未撤成交时，按调用方指定修订号给出可直接提交 /imports/quotes 的日线。
+    """
+    _check_iso_date(tdate)
+    with db.get_conn(db_file) as conn, db.read_snapshot(conn):
+        rows = conn.execute(
+            "SELECT minute_ts, open, high, low, close, volume, trade_count "
+            "FROM minute_bars WHERE security_code = ? AND trade_date = ? "
+            "ORDER BY minute_ts",
+            (code, tdate),
+        ).fetchall()
+        minutes = [MinuteBar(**dict(r)) for r in rows]
+
+        daily: DailyBar | None = None
+        daily_import: DailyQuoteImport | None = None
+        if minutes:
+            daily = DailyBar(
+                open=minutes[0].open,
+                high=max(m.high for m in minutes),
+                low=min(m.low for m in minutes),
+                close=minutes[-1].close,
+                volume=math.fsum(m.volume for m in minutes),
+                trade_count=sum(m.trade_count for m in minutes),
+            )
+            daily_import = DailyQuoteImport(
+                security_code=code,
+                trade_date=tdate,
+                revision=revision,
+                open=daily.open,
+                high=daily.high,
+                low=daily.low,
+                close=daily.close,
+                volume=daily.volume,
+            )
+    return BarsResponse(
+        security_code=code,
+        trade_date=tdate,
+        minute_bars=minutes,
+        daily=daily,
+        daily_quote_import=daily_import,
+    )
 
 
 # ---------------------------------------------------------------- 查询
